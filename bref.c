@@ -88,6 +88,12 @@ static int talk(uint32_t *wb, uint32_t wlen, uint8_t *rb, uint32_t rlen, uint32_
     return 0;
 }
 
+/* No read buffer means the ioctl returns as soon as the write side is taken in instead of
+ * blocking until something arrives on the read side, which is what a nonzero read_size asks for. */
+static int talk_write_only(uint32_t *wb, uint32_t wlen) {
+    return talk(wb, wlen, 0, 0, 0);
+}
+
 static void put_s16(uint8_t *d, size_t *o, const char *s) {
     size_t n = strlen(s);
     memcpy(d + *o, &n, 4); *o += 4;
@@ -100,7 +106,7 @@ static void put_s16(uint8_t *d, size_t *o, const char *s) {
 }
 
 static int transact(uint32_t handle, uint32_t code, const void *data, uint32_t dsize,
-                    const struct fbo *obj, uint8_t *rb, uint32_t rlen, uint32_t *rout) {
+                    struct fbo *obj, uint8_t *rb, uint32_t rlen, uint32_t *rout) {
     static uint32_t wb[1024];
     uint32_t k = 0;
     wb[k++] = BC_TRANSACTION;
@@ -113,7 +119,25 @@ static int transact(uint32_t handle, uint32_t code, const void *data, uint32_t d
     t->data.ptr.buffer = (uint32_t)(uintptr_t)data;
     t->data.ptr.offsets = obj ? (uint32_t)(uintptr_t)obj : 0;
     k += sizeof *t / 4;
-    return talk(wb, k * 4, rb, rlen, rout);
+    if (talk(wb, k * 4, rb, rlen, rout)) return -1;
+    /*
+     * The write is taken in first (the daemon answers with an ACK), and the reply arrives on the read
+     * side afterwards, so one ioctl that asks for both at once comes back with only the ACK. Keep
+     * reading until a reply command shows up.
+     */
+    for (int spin = 0; spin < 200; spin++) {
+        uint32_t got = rout ? *rout : 0, cmd;
+        for (uint32_t i = 0; i + 4 <= got; ) {
+            memcpy(&cmd, rb + i, 4);
+            if (cmd == BR_REPLY) return 0;
+            if (cmd == BR_TRANSACTION) { i += 4 + sizeof(struct btd); continue; }
+            if (cmd == BR_ACQUIRE || cmd == BR_RELEASE || cmd == BR_INCREFS || cmd == BR_DECREFS) { i += 12; continue; }
+            i += 4;
+        }
+        usleep(10000);
+        if (talk(0, 0, rb, rlen, rout)) return -1;
+    }
+    return 0;
 }
 
 static void dump(const char *what, const uint8_t *d, uint32_t n) {
@@ -129,10 +153,11 @@ int main(void) {
     uint32_t rout;
 
     if (binder_open()) return 1;
+    setvbuf(stdout, NULL, _IONBF, 0);
     printf("binder fd %d\n", bfd);
 
     uint32_t wb[2] = { BC_ENTER_LOOPER };
-    talk(wb, 4, rb, sizeof rb, &rout);
+    talk_write_only(wb, 4);
 
     size_t o = 0;
     put_s16((uint8_t *)payload, &o, "android.os.IServiceManager");
@@ -159,23 +184,26 @@ int main(void) {
     for (uint32_t i = 0; i + 8 <= rout; ) {
         uint32_t cmd;
         memcpy(&cmd, rb + i, 4);
-        if (cmd == BR_REPLY || cmd == BR_TRANSACTION) {
+        if (cmd == BR_REPLY) {
             struct btd *t = (struct btd *)(rb + i + 4);
-            printf("  %s code %u data %u offsets %u\n",
-                   cmd == BR_REPLY ? "BR_REPLY" : "BR_TRANSACTION", t->code, t->data_size, t->offsets_size);
+            printf("BR_REPLY code %u data %u offsets %u\n", t->code, t->data_size, t->offsets_size);
             if (t->data_size >= sizeof(struct fbo)) {
                 struct fbo f;
                 memcpy(&f, (void *)(uintptr_t)t->data.ptr.buffer, sizeof f);
                 printf("  object: type %#x binder %#x cookie %#x -> %s\n", f.type, f.binder, f.cookie,
                        f.type == T_BINDER ? "T_BINDER (home again)" :
                        f.type == T_HANDLE ? "T_HANDLE" : "?");
+            } else if (t->data_size == 4) {
+                int32_t v;
+                memcpy(&v, (void *)(uintptr_t)t->data.ptr.buffer, 4);
+                printf("  result %d\n", v);
             }
-            uint32_t fb[1] = { BC_FREE_BUFFER };
-            uint32_t bufp[1] = { t->data.ptr.buffer };
-            talk(fb, 4, bufp, 4, NULL);
+            uint32_t fb[2] = { BC_FREE_BUFFER, t->data.ptr.buffer };
+            talk_write_only(fb, 8);
             i += 4 + sizeof *t;
             continue;
         }
+        if (cmd == BR_TRANSACTION) { i += 4 + sizeof(struct btd); continue; }
         if (cmd == BR_ACQUIRE || cmd == BR_RELEASE || cmd == BR_INCREFS || cmd == BR_DECREFS) {
             uint32_t p[2];
             memcpy(p, rb + i + 4, 8);
