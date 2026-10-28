@@ -48,12 +48,12 @@ jobs:
       - name: test surfaceflinger
         run: |
           set -x
-          rm -f /tmp/b.sock /tmp/bd.log /tmp/sf.log
+          rm -f /tmp/b.sock /tmp/bd.log /tmp/sf-binder.log
           nohup /tmp/sbd -s /tmp/b.sock -v > /tmp/bd.log 2>&1 &
           sleep 1
-          GUEST_BINDER=/tmp/b.sock GUEST_VERBOSE=1 timeout 10 ./qemu-arm -L fw fw/system/bin/surfaceflinger > /tmp/sf.log 2>&1 || true
-          echo '=== surfaceflinger ==='
-          head -40 /tmp/sf.log
+          GUEST_BINDER=/tmp/b.sock GUEST_BINDER_VERBOSE=1 GUEST_BINDER_LOG=/tmp/sf-binder.log timeout 12 ./qemu-arm -L fw fw/system/bin/surfaceflinger > /tmp/sf-binder.log 2>&1 || true
+          echo '=== surfaceflinger stdout/stderr ==='
+          head -50 /tmp/sf-binder.log
           echo '=== daemon ==='
           tail -40 /tmp/bd.log
           pkill -f '/tmp/sbd' || true
@@ -61,14 +61,14 @@ jobs:
       - name: test service query
         run: |
           set -x
-          rm -f /tmp/b.sock /tmp/bd.log /tmp/sm.log /tmp/sf.log /tmp/cl.log
+          rm -f /tmp/b.sock /tmp/bd.log /tmp/sm.log /tmp/sf-binder.log /tmp/cl.log
           nohup /tmp/sbd -s /tmp/b.sock -v > /tmp/bd.log 2>&1 &
           sleep 1
           # 启动 servicemanager
           GUEST_BINDER=/tmp/b.sock GUEST_VERBOSE=1 nohup ./qemu-arm -L fw fw/system/bin/servicemanager > /tmp/sm.log 2>&1 &
           sleep 2
           # 启动 surfaceflinger
-          GUEST_BINDER=/tmp/b.sock GUEST_VERBOSE=1 nohup ./qemu-arm -L fw fw/system/bin/surfaceflinger > /tmp/sf.log 2>&1 &
+          GUEST_BINDER=/tmp/b.sock GUEST_VERBOSE=1 nohup ./qemu-arm -L fw fw/system/bin/surfaceflinger > /tmp/sf-binder.log 2>&1 &
           sleep 3
           # 查询服务
           GUEST_BINDER=/tmp/b.sock GUEST_VERBOSE=1 timeout 8 ./qemu-arm -L fw ./client SurfaceFlinger > /tmp/cl.log 2>&1 || true
@@ -86,5 +86,5 @@ jobs:
           name: test-logs
           path: |
             /tmp/sm.log
-            /tmp/sf.log
+            /tmp/sf-binder.log
             /tmp/bd.log
