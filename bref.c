@@ -10,13 +10,15 @@
 
 #define BINDER_WRITE_READ 0xc0186201
 
-#define BC_TRANSACTION 0x40406300
-#define BC_REPLY 0x40406301
-#define BC_ACQUIRE 0x40046302
-#define BC_RELEASE 0x40046303
-#define BC_INCREFS 0x40046304
-#define BC_DECREFS 0x40046305
-#define BC_FREE_BUFFER 0x40046357
+/* _IOW('c', n, type) on 32-bit: 0x40000000 | (sizeof type << 16) | ('c' << 8) | n.
+ * binder_transaction_data is 0x1c, binder_uintptr_t and uint32_t are 4. */
+#define BC_TRANSACTION 0x401c6300
+#define BC_REPLY 0x401c6301
+#define BC_ACQUIRE 0x40046305
+#define BC_RELEASE 0x40046306
+#define BC_INCREFS 0x40046307
+#define BC_DECREFS 0x40046308
+#define BC_FREE_BUFFER 0x40046303
 #define BC_ENTER_LOOPER 0x630c
 #define BC_EXIT_LOOPER 0x630d
 
@@ -53,10 +55,8 @@ struct btd {
     uint32_t sender_euid;
     uint32_t data_size;
     uint32_t offsets_size;
-    union {
-        struct { uint32_t buffer; uint32_t offsets; } ptr;
-        uint8_t buf[8];
-    } data;
+    uint32_t buffer;
+    uint32_t offsets;
 };
 
 struct bwr {
@@ -67,6 +67,12 @@ struct bwr {
     uint32_t read_consumed;
     uint32_t read_buffer;
 };
+
+/* The guest is 32-bit throughout: a transaction header is 28 bytes and the ioctl descriptor says 24
+ * for binder_write_read. Sizing either one wider makes the kernel side read a different layout. */
+_Static_assert(sizeof(struct btd) == 28, "binder_transaction_data must be 28 bytes on 32-bit");
+_Static_assert(sizeof(struct bwr) == 24, "binder_write_read must be 24 bytes on 32-bit");
+_Static_assert(sizeof(struct fbo) == 16, "flat_binder_object must be 16 bytes on 32-bit");
 
 static int bfd = -1;
 
@@ -116,8 +122,8 @@ static int transact(uint32_t handle, uint32_t code, const void *data, uint32_t d
     t->code = code;
     t->data_size = dsize;
     t->offsets_size = obj ? 8 : 0;
-    t->data.ptr.buffer = (uint32_t)(uintptr_t)data;
-    t->data.ptr.offsets = obj ? (uint32_t)(uintptr_t)obj : 0;
+    t->buffer = (uint32_t)(uintptr_t)data;
+    t->offsets = obj ? (uint32_t)(uintptr_t)obj : 0;
     k += sizeof *t / 4;
     if (talk(wb, k * 4, rb, rlen, rout)) return -1;
     /*
@@ -189,16 +195,16 @@ int main(void) {
             printf("BR_REPLY code %u data %u offsets %u\n", t->code, t->data_size, t->offsets_size);
             if (t->data_size >= sizeof(struct fbo)) {
                 struct fbo f;
-                memcpy(&f, (void *)(uintptr_t)t->data.ptr.buffer, sizeof f);
+                memcpy(&f, (void *)(uintptr_t)t->buffer, sizeof f);
                 printf("  object: type %#x binder %#x cookie %#x -> %s\n", f.type, f.binder, f.cookie,
                        f.type == T_BINDER ? "T_BINDER (home again)" :
                        f.type == T_HANDLE ? "T_HANDLE" : "?");
             } else if (t->data_size == 4) {
                 int32_t v;
-                memcpy(&v, (void *)(uintptr_t)t->data.ptr.buffer, 4);
+                memcpy(&v, (void *)(uintptr_t)t->buffer, 4);
                 printf("  result %d\n", v);
             }
-            uint32_t fb[2] = { BC_FREE_BUFFER, t->data.ptr.buffer };
+            uint32_t fb[2] = { BC_FREE_BUFFER, t->buffer };
             talk_write_only(fb, 8);
             i += 4 + sizeof *t;
             continue;
