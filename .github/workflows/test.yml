@@ -1,0 +1,59 @@
+name: binder test
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: fetch qemu
+        run: |
+          curl -sSL --retry 3 -o /tmp/qemu-arm https://github.com/ylh440104/aemu-translator-build/releases/download/latest/qemu-arm-static
+          chmod +x /tmp/qemu-arm
+          /tmp/qemu-arm --version
+
+      - name: build binderd
+        run: |
+          gcc -O2 -Wall -Wno-unused-function -D_GNU_SOURCE -o /tmp/sbd binderd/sensesbinderd.c
+          ls -l /tmp/sbd
+
+      - name: test servicemanager
+        run: |
+          set -x
+          rm -f /tmp/b.sock /tmp/bd.log /tmp/sm.log
+          nohup /tmp/sbd -s /tmp/b.sock -v > /tmp/bd.log 2>&1 &
+          sleep 1
+          cat /tmp/bd.log
+          GUEST_BINDER=/tmp/b.sock GUEST_VERBOSE=1 timeout 10 /tmp/qemu-arm -L fw /system/bin/servicemanager > /tmp/sm.log 2>&1 || true
+          echo '=== servicemanager ==='
+          cat /tmp/sm.log
+          echo '=== daemon ==='
+          tail -40 /tmp/bd.log
+          pkill -f '/tmp/sbd' || true
+
+      - name: test surfaceflinger
+        run: |
+          set -x
+          rm -f /tmp/b.sock /tmp/bd.log /tmp/sf.log
+          nohup /tmp/sbd -s /tmp/b.sock -v > /tmp/bd.log 2>&1 &
+          sleep 1
+          GUEST_BINDER=/tmp/b.sock GUEST_VERBOSE=1 timeout 10 /tmp/qemu-arm -L fw /system/bin/surfaceflinger > /tmp/sf.log 2>&1 || true
+          echo '=== surfaceflinger ==='
+          head -40 /tmp/sf.log
+          echo '=== daemon ==='
+          tail -40 /tmp/bd.log
+          pkill -f '/tmp/sbd' || true
+
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: |
+            /tmp/sm.log
+            /tmp/sf.log
+            /tmp/bd.log
