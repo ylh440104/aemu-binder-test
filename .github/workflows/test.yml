@@ -16,6 +16,16 @@ jobs:
           ./qemu-arm --version
           chmod +x fw/system/bin/*
 
+      - name: install cross compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-arm-linux-gnueabihf
+
+      - name: build client
+        run: |
+          arm-linux-gnueabihf-gcc -static -O2 -o client client.c
+          file client
+
       - name: build binderd
         run: |
           gcc -O2 -Wall -Wno-unused-function -D_GNU_SOURCE -o /tmp/sbd binderd/sensesbinderd.c
@@ -47,6 +57,27 @@ jobs:
           echo '=== daemon ==='
           tail -40 /tmp/bd.log
           pkill -f '/tmp/sbd' || true
+
+      - name: test service query
+        run: |
+          set -x
+          rm -f /tmp/b.sock /tmp/bd.log /tmp/sm.log /tmp/sf.log /tmp/cl.log
+          nohup /tmp/sbd -s /tmp/b.sock -v > /tmp/bd.log 2>&1 &
+          sleep 1
+          # 启动 servicemanager
+          GUEST_BINDER=/tmp/b.sock GUEST_VERBOSE=1 nohup ./qemu-arm -L fw fw/system/bin/servicemanager > /tmp/sm.log 2>&1 &
+          sleep 2
+          # 启动 surfaceflinger
+          GUEST_BINDER=/tmp/b.sock GUEST_VERBOSE=1 nohup ./qemu-arm -L fw fw/system/bin/surfaceflinger > /tmp/sf.log 2>&1 &
+          sleep 3
+          # 查询服务
+          GUEST_BINDER=/tmp/b.sock GUEST_VERBOSE=1 timeout 8 ./qemu-arm -L fw ./client SurfaceFlinger > /tmp/cl.log 2>&1 || true
+          echo '=== client ==='
+          cat /tmp/cl.log
+          echo '=== daemon ==='
+          tail -50 /tmp/bd.log
+          pkill -f '/tmp/sbd' || true
+          pkill -f 'qemu-arm' || true
 
       - name: upload logs
         if: always()
