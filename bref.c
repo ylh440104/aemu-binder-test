@@ -115,7 +115,7 @@ static void put_s16(uint8_t *d, size_t *o, const char *s) {
 }
 
 static int transact(uint32_t handle, uint32_t code, const void *data, uint32_t dsize,
-                    struct fbo *obj, uint8_t *rb, uint32_t rlen, uint32_t *rout) {
+                    const uint32_t *offs, uint8_t *rb, uint32_t rlen, uint32_t *rout) {
     static uint32_t wb[1024];
     uint32_t k = 0;
     wb[k++] = BC_TRANSACTION;
@@ -124,9 +124,10 @@ static int transact(uint32_t handle, uint32_t code, const void *data, uint32_t d
     t->handle = handle;
     t->code = code;
     t->data_size = dsize;
-    t->offsets_size = obj ? 8 : 0;
+    /* one four-byte entry per object on the guest side, which the protocol boundary widens to eight */
+    t->offsets_size = offs ? 4 : 0;
     t->buffer = (uint32_t)(uintptr_t)data;
-    t->offsets = obj ? (uint32_t)(uintptr_t)obj : 0;
+    t->offsets = offs ? (uint32_t)(uintptr_t)offs : 0;
     k += sizeof *t / 4;
     if (talk_write_only(wb, k * 4)) return -1;
     /*
@@ -197,7 +198,7 @@ static void show_reply(const uint8_t *rb) {
 
 int main(void) {
     char payload[256];
-    struct fbo obj;
+    uint32_t offs_tbl[2];
     uint8_t rb[4096];
     uint32_t rout;
 
@@ -211,15 +212,25 @@ int main(void) {
     size_t o = 0;
     put_s16((uint8_t *)payload, &o, "android.os.IServiceManager");
     put_s16((uint8_t *)payload, &o, "test.svc");
+    size_t objoff = o;
 
+    /*
+     * The offset table is a run of offsets, not a run of objects: each entry says where inside the
+     * parcel a flat_binder_object sits. Handing the daemon the object itself made it read the
+     * object's type word as an offset and reject the transaction.
+     */
+    struct fbo obj;
     memset(&obj, 0, sizeof obj);
     obj.type = T_BINDER;
     obj.flags = 0x7f | 0x100;
     obj.binder = (uint32_t)(uintptr_t)&obj;
     obj.cookie = (uint32_t)(uintptr_t)&payload[0];
-    printf("registering own object at %p\n", (void *)&obj);
+    memcpy(payload + o, &obj, sizeof obj);
+    o += sizeof obj;
+    offs_tbl[0] = (uint32_t)objoff;
+    printf("registering own object at %p, offset %zu\n", (void *)&obj, objoff);
 
-    if (transact(0, 3, payload, (uint32_t)o, &obj, rb, sizeof rb, &rout)) return 1;
+    if (transact(0, 3, payload, (uint32_t)o, offs_tbl, rb, sizeof rb, &rout)) return 1;
     dump("addService reply", rb, rout);
     show_reply(rb);
 
