@@ -161,11 +161,17 @@ static void kick_proc(struct proc *p);
 static int sb_send(struct thread *th, u32 type, const void *body, u32 blen, const int *fds, int nfds, u32 flags);
 static void node_work(struct node *n) {
     if (!n || !n->owner) return;
-    if (n->has_strong && !n->has_weak) return;
     if (n->queued) return;
-    if (n->internal_strong > 0 || n->pend_strong > 0 || n->pend_weak > 0) return;
-    if (!n->has_strong && !n->has_weak) return;
-    if (n->local_strong > 0 || n->local_weak > 0) return;
+    /*
+     * The owner only has something to do when what it has been told differs from what is true.
+     * Stating it that way covers the case that used to fall through: a node the owner has just
+     * published holds its own reference, so there is a BR_ACQUIRE to deliver even though neither
+     * flag is set yet. The old chain of early returns saw two zero flags and gave up.
+     */
+    int strong = n->internal_strong || n->local_strong;
+    int weak = n->nrefs || n->local_weak || strong;
+    if (strong == n->has_strong && weak == n->has_weak) return;
+    if (n->pend_strong > 0 || n->pend_weak > 0) return;
     if (!n->owner->threads) return;
     struct work *w = mkwork(W_NODE);
     w->node = n;
@@ -419,6 +425,15 @@ static int translate(struct thread *th, struct proc *to, struct txn *t, char *da
             struct node *nd = node_get(p, o->binder, o->cookie, 1);
             struct ref *r = ref_for_node(to, nd);
             int strong = o->type == T_BINDER;
+            /*
+             * The owner just handed its own object to a parcel, so it holds a reference of its own
+             * to that object. Without recording it the node looks unreferenced, emit_node sends it
+             * BR_RELEASE/BR_DECREFS, and the owner frees the very object the parcel still carries —
+             * which is how getService("power") came back with a T_BINDER whose memory was already
+             * gone, and system_server died on it. The count belongs to the node, not to the parcel,
+             * so it is raised once when the node first appears.
+             */
+            if (nd && nd->nrefs == 1 && !nd->internal_strong) { nd->internal_strong = 1; node_work(nd); }
             o->type = strong ? T_HANDLE : T_WEAK_HANDLE; o->binder = (u32)r->desc; o->cookie = 0;
             ref_inc(r, strong); h->ref = r; h->strong = strong; t->nheld++;
             break;
@@ -428,8 +443,14 @@ static int translate(struct thread *th, struct proc *to, struct txn *t, char *da
             int strong = o->type == T_HANDLE;
             if (!r) return -1;
             if (r->node->owner == to) {
+                /*
+                 * The object is going home. The owner holds it itself, so this is its own reference
+                 * coming back — not one the parcel lends it. Recording it as a held reference made
+                 * BC_FREE_BUFFER take it away again, after which the owner dropped an object it was
+                 * still using. internal_strong is where the owner's own count lives, and it stays.
+                 */
                 o->type = strong ? T_BINDER : T_WEAK_BINDER; o->binder = (u32)r->node->ptr; o->cookie = (u32)r->node->cookie;
-                if (strong) { r->node->local_strong++; node_work(r->node); h->node = r->node; h->strong = 1; t->nheld++; }
+                if (strong) { r->node->internal_strong = 1; node_work(r->node); }
             } else {
                 struct ref *nr = ref_for_node(to, r->node);
                 o->binder = (u32)nr->desc; o->cookie = 0;
@@ -453,6 +474,62 @@ static int translate(struct thread *th, struct proc *to, struct txn *t, char *da
 }
 
 static void proc_release(struct proc *p);
+
+/**
+ * Dump the head of a parcel as hex. Guessing at the layout cost several rounds: two attempts at
+ * decoding String16 produced an empty name because the offsets were not where I assumed. Sixteen
+ * bytes of the real thing answer the question outright.
+ */
+static void parcel_hex(const char *data, u64 size, char *out, size_t cap) {
+    static const char d[] = "0123456789abcdef";
+    // a servicemanager parcel starts with the interface token: a 4-byte length word plus 26 UTF-16
+// characters, which comes to 56 bytes and is already 4-aligned, so the name it refers to begins
+    // exactly at offset 56
+    size_t n = size < 128 ? (size_t)size : 128, o = 0;
+    for (size_t i = 0; i < n && o + 3 < cap; i++) {
+        unsigned char b = (unsigned char)data[i];
+        out[o++] = d[b >> 4];
+        out[o++] = d[b & 15];
+        if ((i & 3) == 3 && o + 2 < cap) out[o++] = ' ';
+    }
+    out[o] = 0;
+}
+
+/**
+ * Print both things a servicemanager call carries: the interface token at offset 0 and the service
+ * name that follows it. The name is what matters — it says whether a process is registering itself
+ * or asking for somebody else, and the earlier "code 1"/"code 2" numbering said neither.
+ */
+static void parcel_dump(const char *data, u64 size, char *out, size_t cap) {
+    size_t o = 0;
+    for (int pass = 0; pass < 2 && o + 8 < cap; pass++) {
+        u64 off = 0;
+        if (pass == 1) {
+            if (size < 4) break;
+            u32 first;
+            memcpy(&first, data, 4);
+            off = 4 + (u64)first * 2;
+            off = (off + 3) & ~3ULL;
+            o += (size_t)snprintf(out + o, cap - o, " | name=");
+        } else {
+            o += (size_t)snprintf(out + o, cap - o, "token=");
+        }
+        if (off + 4 > size) { o += (size_t)snprintf(out + o, cap - o, "<short>"); break; }
+        u32 len;
+        memcpy(&len, data + off, 4);
+        if (len > 200 || off + 4 + (u64)len * 2 > size) {
+            o += (size_t)snprintf(out + o, cap - o, "<bad %u>", len);
+            continue;
+        }
+        size_t i = 0;
+        for (; i < len && o + 2 < cap; i++) {
+            u16 ch;
+            memcpy(&ch, data + off + 4 + i * 2, 2);
+            out[o++] = (ch >= 32 && ch < 127) ? (char)ch : '?';
+        }
+    }
+    out[o] = 0;
+}
 
 static void do_transact(struct thread *th, struct sb_txn *m, char *payload, int *fds, int nfds, int reply) {
     struct proc *p = th->proc;
@@ -503,8 +580,20 @@ static void do_transact(struct thread *th, struct sb_txn *m, char *payload, int 
         to = n->owner;
     }
     t->to_proc = to;
-    if (!reply) V("txn pid %d -> pid %d handle %u code %u flags %#x data %llu",
-                  p->pid, to->pid, m->handle, m->code, m->flags, (unsigned long long)m->data_size);
+    if (!reply) {
+        // Every servicemanager call gets its parcel dumped. The name decoder produced an empty
+        // string twice, and the only way to stop guessing at the layout is to look at the bytes.
+        char hex[420], names[200];
+        if (m->handle == 0 && m->code >= 1 && m->code <= 3) {
+            parcel_dump(t->data, t->data_size, names, sizeof names);
+            parcel_hex(t->data, t->data_size, hex, sizeof hex);
+            V("txn pid %d -> pid %d handle %u code %u data %llu [%s] %s",
+              p->pid, to->pid, m->handle, m->code, (unsigned long long)m->data_size, names, hex);
+        } else {
+            V("txn pid %d -> pid %d handle %u code %u flags %#x data %llu",
+              p->pid, to->pid, m->handle, m->code, m->flags, (unsigned long long)m->data_size);
+        }
+    }
     if (translate(th, to, t, t->data) < 0) {
         V("   !! translate failed for code %u", m->code);
         sb_send(th, SB_R_ACK, 0, 0, 0, 0, 0); txn_free(t); return;
@@ -703,6 +792,24 @@ static void deliver(struct thread *th) {
             p->bufs = b;
         }
         u32 more_flag = (th->todo.head || p->todo.head) ? SB_F_MORE : 0;
+        // A 4-byte reply to a servicemanager call is the int32 result: zero means the service was
+        // added or found, anything else means it was refused. Printing it is the only way to tell
+        // "registered" apart from "already there", which the guest log words identically.
+        if (t->reply && t->data_size == 4 && t->code == 0) {
+            int res;
+            memcpy(&res, t->data, 4);
+            V("   reply result for pid %d: %d", p->pid, res);
+        }
+        // A reply carrying a flat_binder_object is how a lookup hands back a binder. If the object's
+        // type or handle is wrong, the guest treats the cookie as a pointer and dies on it — which is
+        // exactly what a SIGSEGV at si_addr=0x707545e7 after this ioctl looks like. Print the bytes.
+        if (t->reply && t->data_size && t->data_size <= 64) {
+            char rh[420], rn[200];
+            parcel_dump(t->data, t->data_size, rn, sizeof rn);
+            parcel_hex(t->data, t->data_size, rh, sizeof rh);
+            V("   reply body pid %d code %u size %llu [%s] %s",
+              p->pid, t->code, (unsigned long long)t->data_size, rn, rh);
+        }
         V("   send %s to pid %d/%d fd %d: %u bytes, more=%u",
           t->reply ? "reply" : "txn", p->pid, th->tid, th->fd,
           (u32)(sizeof m + total), more_flag);
