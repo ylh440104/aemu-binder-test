@@ -76,6 +76,8 @@ _Static_assert(sizeof(struct bwr) == 24, "binder_write_read must be 24 bytes on 
 _Static_assert(sizeof(struct fbo) == 16, "flat_binder_object must be 16 bytes on 32-bit");
 
 static int bfd = -1;
+/* where the reply sat inside the last read, so the caller can look at it */
+static uint32_t g_reply_off, g_reply_len;
 
 static int binder_open(void) {
     bfd = open("/dev/binder", O_RDWR);
@@ -126,23 +128,43 @@ static int transact(uint32_t handle, uint32_t code, const void *data, uint32_t d
     t->buffer = (uint32_t)(uintptr_t)data;
     t->offsets = obj ? (uint32_t)(uintptr_t)obj : 0;
     k += sizeof *t / 4;
-    if (talk(wb, k * 4, rb, rlen, rout)) return -1;
+    if (talk_write_only(wb, k * 4)) return -1;
     /*
      * The write is taken in first (the daemon answers with an ACK), and the reply arrives on the read
-     * side afterwards, so one ioctl that asks for both at once comes back with only the ACK. Keep
-     * reading until a reply command shows up.
+     * side afterwards. Asking for both in one ioctl blocks inside the first call until something is
+     * readable, which hides the transaction from the daemon — so read separately.
      */
-    for (int spin = 0; spin < 200; spin++) {
+    g_reply_off = g_reply_len = 0;
+    for (int spin = 0; spin < 300; spin++) {
+        if (talk(0, 0, rb, rlen, rout)) return -1;
         uint32_t got = rout ? *rout : 0, cmd;
         for (uint32_t i = 0; i + 4 <= got; ) {
             memcpy(&cmd, rb + i, 4);
-            if (cmd == BR_REPLY) return 0;
-            if (cmd == BR_TRANSACTION) { i += 4 + sizeof(struct btd); continue; }
-            if (cmd == BR_ACQUIRE || cmd == BR_RELEASE || cmd == BR_INCREFS || cmd == BR_DECREFS) { i += 12; continue; }
+            if (cmd == BR_REPLY) {
+                struct btd *t = (struct btd *)(rb + i + 4);
+                g_reply_off = i + 4;
+                g_reply_len = (uint32_t)sizeof *t;
+                (void)t;
+                return 0;
+            }
+            if (cmd == BR_TRANSACTION) {
+                struct btd *t = (struct btd *)(rb + i + 4);
+                uint32_t fb[2] = { BC_FREE_BUFFER, t->buffer };
+                talk_write_only(fb, 8);
+                i += 4 + sizeof *t;
+                continue;
+            }
+            if (cmd == BR_ACQUIRE || cmd == BR_RELEASE || cmd == BR_INCREFS || cmd == BR_DECREFS) {
+                uint32_t p[2];
+                memcpy(p, rb + i + 4, 8);
+                printf("  ref cmd %#x ptr %#x\n", cmd, p[0]);
+                i += 12;
+                continue;
+            }
+            if (cmd != 0x720c /* BR_NOOP */) printf("  cmd %#x\n", cmd);
             i += 4;
         }
         usleep(10000);
-        if (talk(0, 0, rb, rlen, rout)) return -1;
     }
     return 0;
 }
@@ -151,6 +173,26 @@ static void dump(const char *what, const uint8_t *d, uint32_t n) {
     printf("%s: %u bytes:", what, n);
     for (uint32_t i = 0; i < n && i < 40; i++) printf(" %02x", d[i]);
     printf("\n");
+}
+
+/* Prints what came back in the parcel the reply points at. */
+static void show_reply(const uint8_t *rb) {
+    if (!g_reply_off) { printf("  (no reply)\n"); return; }
+    const struct btd *t = (const struct btd *)(rb + g_reply_off);
+    printf("  reply code %u data %u offsets %u\n", t->code, t->data_size, t->offsets_size);
+    if (t->data_size >= sizeof(struct fbo)) {
+        struct fbo f;
+        memcpy(&f, (const void *)(uintptr_t)t->buffer, sizeof f);
+        printf("  object: type %#x binder %#x cookie %#x -> %s\n", f.type, f.binder, f.cookie,
+               f.type == T_BINDER ? "T_BINDER (its own again)" :
+               f.type == T_HANDLE ? "T_HANDLE" : "?");
+    } else if (t->data_size == 4) {
+        int32_t v;
+        memcpy(&v, (const void *)(uintptr_t)t->buffer, 4);
+        printf("  result %d\n", v);
+    }
+    uint32_t fb[2] = { BC_FREE_BUFFER, t->buffer };
+    talk_write_only(fb, 8);
 }
 
 int main(void) {
@@ -179,6 +221,7 @@ int main(void) {
 
     if (transact(0, 3, payload, (uint32_t)o, &obj, rb, sizeof rb, &rout)) return 1;
     dump("addService reply", rb, rout);
+    show_reply(rb);
 
     usleep(200000);
 
@@ -187,40 +230,7 @@ int main(void) {
     put_s16((uint8_t *)payload, &o, "test.svc");
     if (transact(0, 1, payload, (uint32_t)o, NULL, rb, sizeof rb, &rout)) return 1;
     dump("getService reply", rb, rout);
-
-    for (uint32_t i = 0; i + 8 <= rout; ) {
-        uint32_t cmd;
-        memcpy(&cmd, rb + i, 4);
-        if (cmd == BR_REPLY) {
-            struct btd *t = (struct btd *)(rb + i + 4);
-            printf("BR_REPLY code %u data %u offsets %u\n", t->code, t->data_size, t->offsets_size);
-            if (t->data_size >= sizeof(struct fbo)) {
-                struct fbo f;
-                memcpy(&f, (void *)(uintptr_t)t->buffer, sizeof f);
-                printf("  object: type %#x binder %#x cookie %#x -> %s\n", f.type, f.binder, f.cookie,
-                       f.type == T_BINDER ? "T_BINDER (home again)" :
-                       f.type == T_HANDLE ? "T_HANDLE" : "?");
-            } else if (t->data_size == 4) {
-                int32_t v;
-                memcpy(&v, (void *)(uintptr_t)t->buffer, 4);
-                printf("  result %d\n", v);
-            }
-            uint32_t fb[2] = { BC_FREE_BUFFER, t->buffer };
-            talk_write_only(fb, 8);
-            i += 4 + sizeof *t;
-            continue;
-        }
-        if (cmd == BR_TRANSACTION) { i += 4 + sizeof(struct btd); continue; }
-        if (cmd == BR_ACQUIRE || cmd == BR_RELEASE || cmd == BR_INCREFS || cmd == BR_DECREFS) {
-            uint32_t p[2];
-            memcpy(p, rb + i + 4, 8);
-            printf("  ref cmd %#x ptr %#x\n", cmd, p[0]);
-            i += 12;
-            continue;
-        }
-        printf("  cmd %#x\n", cmd);
-        i += 4;
-    }
+    show_reply(rb);
 
     printf("survived\n");
     return 0;
