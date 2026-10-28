@@ -11,9 +11,9 @@
 #define BINDER_WRITE_READ 0xc0186201
 
 /* _IOW('c', n, type) on 32-bit: 0x40000000 | (sizeof type << 16) | ('c' << 8) | n.
- * binder_transaction_data is 0x1c, binder_uintptr_t and uint32_t are 4. */
-#define BC_TRANSACTION 0x401c6300
-#define BC_REPLY 0x401c6301
+ * binder_transaction_data is 0x28, binder_uintptr_t and uint32_t are 4. */
+#define BC_TRANSACTION 0x40286300
+#define BC_REPLY 0x40286301
 #define BC_ACQUIRE 0x40046305
 #define BC_RELEASE 0x40046306
 #define BC_INCREFS 0x40046307
@@ -68,9 +68,10 @@ struct bwr {
     uint32_t read_buffer;
 };
 
-/* The guest is 32-bit throughout: a transaction header is 28 bytes and the ioctl descriptor says 24
- * for binder_write_read. Sizing either one wider makes the kernel side read a different layout. */
-_Static_assert(sizeof(struct btd) == 28, "binder_transaction_data must be 28 bytes on 32-bit");
+/* Ten 32-bit words: target, cookie, code, flags, sender_pid, sender_euid, data_size, offsets_size,
+ * then the parcel's buffer and its offset table. Sizing any of them wider makes the kernel side read
+ * a different layout, which is what the ioctl descriptor has to agree with as well. */
+_Static_assert(sizeof(struct btd) == 40, "binder_transaction_data must be 40 bytes on 32-bit");
 _Static_assert(sizeof(struct bwr) == 24, "binder_write_read must be 24 bytes on 32-bit");
 _Static_assert(sizeof(struct fbo) == 16, "flat_binder_object must be 16 bytes on 32-bit");
 
