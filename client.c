@@ -13,15 +13,15 @@
 struct binder_write_read {
     uint32_t write_size;
     uint32_t write_consumed;
-    uint64_t write_buffer;
+    uint32_t write_buffer;
     uint32_t read_size;
     uint32_t read_consumed;
-    uint64_t read_buffer;
+    uint32_t read_buffer;
 };
 
 struct binder_transaction_data {
-    union { uint32_t handle; uint64_t ptr; } target;
-    uint64_t cookie;
+    union { uint32_t handle; uint32_t ptr; } target;
+    uint32_t cookie;
     uint32_t code;
     uint32_t flags;
     int32_t sender_pid;
@@ -29,7 +29,7 @@ struct binder_transaction_data {
     uint32_t data_size;
     uint32_t offsets_size;
     union {
-        struct { uint64_t buffer; uint64_t offsets; } ptr;
+        struct { uint32_t buffer; uint32_t offsets; } ptr;
         uint8_t buf[8];
     } data;
 };
@@ -50,9 +50,9 @@ static int binder_write_read(int fd, void *wdata, size_t wsize, void *rdata, siz
     struct binder_write_read bwr;
     memset(&bwr, 0, sizeof bwr);
     bwr.write_size = wsize;
-    bwr.write_buffer = (uint64_t)(uintptr_t)wdata;
+    bwr.write_buffer = (uint32_t)(uintptr_t)wdata;
     bwr.read_size = rsize;
-    bwr.read_buffer = (uint64_t)(uintptr_t)rdata;
+    bwr.read_buffer = (uint32_t)(uintptr_t)rdata;
     int r = ioctl(fd, BINDER_WRITE_READ, &bwr);
     if (r < 0) { perror("BINDER_WRITE_READ"); return -1; }
     return bwr.read_consumed;
@@ -88,7 +88,7 @@ static int get_service(int fd, const char *name) {
     put_string16(&p, "android.os.IServiceManager");
     put_string16(&p, name);
     tr->data_size = (uint32_t)(p - data);
-    tr->data.ptr.buffer = (uint64_t)(uintptr_t)data;
+    tr->data.ptr.buffer = (uint32_t)(uintptr_t)data;
     tr->offsets_size = 0;
     int n = binder_write_read(fd, wbuf, p - wbuf, rbuf, sizeof rbuf);
     if (n <= 0) { printf("get_service(%s): no reply\n", name); return -1; }
