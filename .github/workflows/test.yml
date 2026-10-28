@@ -23,7 +23,7 @@ jobs:
 
       - name: build client
         run: |
-          arm-linux-gnueabihf-gcc -static -O2 -o client client.c
+          arm-linux-gnueabihf-gcc -static -O2 -o client client2.c
           file client
 
       - name: build binderd
