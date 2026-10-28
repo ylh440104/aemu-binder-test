@@ -12,9 +12,8 @@ jobs:
 
       - name: fetch qemu
         run: |
-          curl -sSL --retry 3 -o /tmp/qemu-arm https://github.com/ylh440104/aemu-translator-build/releases/download/latest/qemu-arm-static
-          chmod +x /tmp/qemu-arm
-          /tmp/qemu-arm --version
+          chmod +x qemu-arm
+          ./qemu-arm --version
 
       - name: build binderd
         run: |
@@ -28,7 +27,7 @@ jobs:
           nohup /tmp/sbd -s /tmp/b.sock -v > /tmp/bd.log 2>&1 &
           sleep 1
           cat /tmp/bd.log
-          GUEST_BINDER=/tmp/b.sock GUEST_VERBOSE=1 timeout 10 /tmp/qemu-arm -L fw /system/bin/servicemanager > /tmp/sm.log 2>&1 || true
+          GUEST_BINDER=/tmp/b.sock GUEST_VERBOSE=1 timeout 10 ./qemu-arm -L fw /system/bin/servicemanager > /tmp/sm.log 2>&1 || true
           echo '=== servicemanager ==='
           cat /tmp/sm.log
           echo '=== daemon ==='
@@ -41,7 +40,7 @@ jobs:
           rm -f /tmp/b.sock /tmp/bd.log /tmp/sf.log
           nohup /tmp/sbd -s /tmp/b.sock -v > /tmp/bd.log 2>&1 &
           sleep 1
-          GUEST_BINDER=/tmp/b.sock GUEST_VERBOSE=1 timeout 10 /tmp/qemu-arm -L fw /system/bin/surfaceflinger > /tmp/sf.log 2>&1 || true
+          GUEST_BINDER=/tmp/b.sock GUEST_VERBOSE=1 timeout 10 ./qemu-arm -L fw /system/bin/surfaceflinger > /tmp/sf.log 2>&1 || true
           echo '=== surfaceflinger ==='
           head -40 /tmp/sf.log
           echo '=== daemon ==='
