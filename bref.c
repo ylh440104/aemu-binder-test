@@ -140,25 +140,40 @@ static int transact(uint32_t handle, uint32_t code, const void *data, uint32_t d
      * readable, which hides the transaction from the daemon — so read separately.
      */
     g_reply_off = g_reply_len = 0;
-    for (int spin = 0; spin < 300; spin++) {
+    for (int spin = 0; spin < 600; spin++) {
         if (talk(0, 0, rb, rlen, rout)) return -1;
-        uint32_t got = rout ? *rout : 0;
-        if (spin < 3 || got) printf("  read %u bytes\n", got);
+        uint32_t got = rout ? *rout : 0, cmd;
         /*
-         * Commands are word aligned and every one starts with a four byte command word, but the ones
-         * carrying a payload are followed by structs whose sizes vary. Scanning word by word for the
-         * command we want sidesteps having to model every payload: a stray word cannot spell
-         * BR_REPLY by accident, and the offsets it would produce are never used.
+         * The daemon hands back one command per read, and the command word comes on its own: the
+         * header that follows it arrives in the next read. So look at the word first, and only then
+         * wait for the payload.
          */
-        for (uint32_t i = 0; i + 4 + sizeof(struct btd) <= got; i += 4) {
-            uint32_t cmd;
-            memcpy(&cmd, rb + i, 4);
-            if (cmd != BR_REPLY) continue;
-            g_reply_off = i + 4;
+        if (got < 4) { usleep(5000); continue; }
+        memcpy(&cmd, rb, 4);
+        if (cmd == BR_REPLY) {
+            uint32_t need = 4 + (uint32_t)sizeof(struct btd);
+            while (got < need) {
+                usleep(5000);
+                if (talk(0, 0, rb + got, rlen - got, &rout)) return -1;
+                got += rout ? *rout : 0;
+            }
+            g_reply_off = 4;
             g_reply_len = (uint32_t)sizeof(struct btd);
             return 0;
         }
-        usleep(10000);
+        if (cmd == BR_TRANSACTION) {
+            uint32_t need = 4 + (uint32_t)sizeof(struct btd);
+            while (got < need) {
+                usleep(5000);
+                if (talk(0, 0, rb + got, rlen - got, &rout)) return -1;
+                got += rout ? *rout : 0;
+            }
+            struct btd *t = (struct btd *)(rb + 4);
+            uint32_t fb[2] = { BC_FREE_BUFFER, t->buffer };
+            talk_write_only(fb, 8);
+            continue;
+        }
+        usleep(5000);
     }
     return 0;
 }
