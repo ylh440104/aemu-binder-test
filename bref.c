@@ -143,6 +143,7 @@ static int transact(uint32_t handle, uint32_t code, const void *data, uint32_t d
     for (int spin = 0; spin < 300; spin++) {
         if (talk(0, 0, rb, rlen, rout)) return -1;
         uint32_t got = rout ? *rout : 0;
+        if (spin < 3 || got) printf("  read %u bytes\n", got);
         /*
          * Commands are word aligned and every one starts with a four byte command word, but the ones
          * carrying a payload are followed by structs whose sizes vary. Scanning word by word for the
