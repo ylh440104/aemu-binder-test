@@ -22,17 +22,21 @@
 #define BC_ENTER_LOOPER 0x630c
 #define BC_EXIT_LOOPER 0x630d
 
-#define BR_TRANSACTION 0x80407200
-#define BR_REPLY 0x80407201
-#define BR_ACQUIRE 0x40047208
-#define BR_RELEASE 0x40047209
-#define BR_INCREFS 0x40047207
-#define BR_DECREFS 0x4004720a
+/* _IOR('r', n, type) is 0x80000000 | (sizeof type << 16) | ('r' << 8) | n, and _IO is the same
+ * with a zero size. binder_transaction_data is 0x28, binder_ptr_cookie and binder_uintptr_t are 8. */
+#define BR_ERROR 0x80047200
+#define BR_OK 0x7201
+#define BR_TRANSACTION 0x80287202
+#define BR_REPLY 0x80287203
+#define BR_DEAD_REPLY 0x7205
+#define BR_TRANSACTION_COMPLETE 0x7206
+#define BR_INCREFS 0x40087207
+#define BR_ACQUIRE 0x40087208
+#define BR_RELEASE 0x40087209
+#define BR_DECREFS 0x4008720a
 #define BR_NOOP 0x720c
 #define BR_SPAWN_LOOPER 0x720d
-#define BR_FAILED_REPLY 0x7217
-#define BR_DEAD_REPLY 0x7215
-#define BR_ERROR 0x80007216
+#define BR_FAILED_REPLY 0x7211
 
 #define TF_ONE_WAY 0x01
 
@@ -138,32 +142,20 @@ static int transact(uint32_t handle, uint32_t code, const void *data, uint32_t d
     g_reply_off = g_reply_len = 0;
     for (int spin = 0; spin < 300; spin++) {
         if (talk(0, 0, rb, rlen, rout)) return -1;
-        uint32_t got = rout ? *rout : 0, cmd;
-        for (uint32_t i = 0; i + 4 <= got; ) {
+        uint32_t got = rout ? *rout : 0;
+        /*
+         * Commands are word aligned and every one starts with a four byte command word, but the ones
+         * carrying a payload are followed by structs whose sizes vary. Scanning word by word for the
+         * command we want sidesteps having to model every payload: a stray word cannot spell
+         * BR_REPLY by accident, and the offsets it would produce are never used.
+         */
+        for (uint32_t i = 0; i + 4 + sizeof(struct btd) <= got; i += 4) {
+            uint32_t cmd;
             memcpy(&cmd, rb + i, 4);
-            if (cmd == BR_REPLY) {
-                struct btd *t = (struct btd *)(rb + i + 4);
-                g_reply_off = i + 4;
-                g_reply_len = (uint32_t)sizeof *t;
-                (void)t;
-                return 0;
-            }
-            if (cmd == BR_TRANSACTION) {
-                struct btd *t = (struct btd *)(rb + i + 4);
-                uint32_t fb[2] = { BC_FREE_BUFFER, t->buffer };
-                talk_write_only(fb, 8);
-                i += 4 + sizeof *t;
-                continue;
-            }
-            if (cmd == BR_ACQUIRE || cmd == BR_RELEASE || cmd == BR_INCREFS || cmd == BR_DECREFS) {
-                uint32_t p[2];
-                memcpy(p, rb + i + 4, 8);
-                printf("  ref cmd %#x ptr %#x\n", cmd, p[0]);
-                i += 12;
-                continue;
-            }
-            if (cmd != 0x720c /* BR_NOOP */) printf("  cmd %#x\n", cmd);
-            i += 4;
+            if (cmd != BR_REPLY) continue;
+            g_reply_off = i + 4;
+            g_reply_len = (uint32_t)sizeof(struct btd);
+            return 0;
         }
         usleep(10000);
     }
